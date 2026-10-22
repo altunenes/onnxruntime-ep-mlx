@@ -18,7 +18,7 @@ jobs:
     name: Op benchmark (macOS arm64)
     runs-on: macos-15
     env:
-      ORT_VERSION: "1.29.0"
+      ORT_VERSION: "1.31.0"
       MLX_VERSION: "0.32.2"
       MLX_COMMIT: "1f8e74e3f12f31365464a6867c6579f0e9b29d85"
       MLXC_COMMIT: "c74db5307cc8ce122f48d97ef951b30578674e7f"
@@ -32,7 +32,10 @@ jobs:
         run: |
           base_sha="origin/main"
           echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
-          if git show "$base_sha:rust/src/engine.rs" | grep -q "mlx_cumsum_axis"; then
+          base_api="$(git show "$base_sha:rust/src/factory.rs" | sed -n 's/^pub const ORT_API_VERSION: u32 = \([0-9]*\);/\1/p')"
+          pr_api="$(sed -n 's/^pub const ORT_API_VERSION: u32 = \([0-9]*\);/\1/p' rust/src/factory.rs)"
+          if [ -n "$pr_api" ] && [ "$base_api" = "$pr_api" ] && \
+             git show "$base_sha:rust/src/engine.rs" | grep -q "mlx_cumsum_axis"; then
             echo "compatible=true" >> "$GITHUB_OUTPUT"
           else
             echo "compatible=false" >> "$GITHUB_OUTPUT"

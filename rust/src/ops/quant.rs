@@ -1222,7 +1222,7 @@ fn matmulnbits_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
 // ---- GatherBlockQuantized -----------------------------------------------------------------------
 
 fn gather_block_quantized_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let block = n.ints.get("block_size").copied().unwrap_or(32) as i32;
+    let block = n.ints.get("block_size").copied().unwrap_or(128) as i32;
     let idx_in = ctx.resolve(&n.inputs[1])?;
     let data = ctx.resolve(&n.inputs[0])?; // uint8 [V, D/2]
     let scales = ctx.resolve(&n.inputs[2])?; // f32 [V, nblocks]
@@ -1233,7 +1233,17 @@ fn gather_block_quantized_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resu
         bs *= d;
     }
     let idx_r = ctx.reshape(idx_in, &[bs])?;
-    let idx = ctx.astype(idx_r, mlx::mlx_dtype__MLX_INT32)?;
+    // Mask before narrowing so large int64 indices cannot wrap into valid rows.
+    let idx64 = ctx.astype(idx_r, mlx::mlx_dtype__MLX_INT64)?;
+    let rows = ctx.dim(data, 0) as i64;
+    let lower = ctx.scalar_i64(-rows);
+    let upper = ctx.scalar_i64(rows);
+    let above_lower = ctx.binary(mlx::mlx_greater_equal, idx64, lower)?;
+    let below_upper = ctx.binary(mlx::mlx_less, idx64, upper)?;
+    let valid = ctx.binary(mlx::mlx_logical_and, above_lower, below_upper)?;
+    let zero_index = ctx.scalar_i64(0);
+    let safe_idx = ctx.where_(valid, idx64, zero_index)?;
+    let idx = ctx.astype(safe_idx, mlx::mlx_dtype__MLX_INT32)?;
 
     let g = gather_rows(ctx, data, idx)?; // [BS, D/2] uint8
     let sg = gather_rows(ctx, scales, idx)?; // [BS, nblocks]
@@ -1280,10 +1290,15 @@ fn gather_block_quantized_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resu
 
     let sc_full = broadcast_blocks(ctx, sg, bs, nblocks, block)?;
     let w = mul(ctx, centered, sc_full)?;
+    let valid = ctx.reshape(valid, &[bs, 1])?;
+    let zero = ctx.scalar_f32(0.0);
+    let w = ctx.where_(valid, w, zero)?;
 
     let mut oshape: Vec<i32> = ish.clone();
     oshape.push(d);
     let out = ctx.reshape(w, &oshape)?;
+    let out_dtype = ctx.dtype_of(scales);
+    let out = ctx.astype(out, out_dtype)?;
     ctx.bind(&n.outputs[0], out);
     Ok(())
 }
@@ -1937,7 +1952,7 @@ fn gather_block_quantized_compile_shape_safety(node: &NodeView) -> CompileShapeS
     gather_block_quantized_compile_shape_safety_for(
         packed_data,
         packed_zero_points,
-        node.int_attr("block_size", 32),
+        node.int_attr("block_size", 128),
         node.input_present(3),
     )
 }
@@ -2010,6 +2025,10 @@ fn gather_block_quantized_claim(node: &NodeView) -> ClaimResult {
         (Some(d), Some(i), Some(s)) => (d, i, s),
         _ => deny!("missing tensor type/shape info on an input"),
     };
+    require!(
+        data.shape.len() == 2 && data.shape[0] > 0,
+        "only rank-2 data with a positive row count is supported"
+    );
     if !is_uint8(data.dtype)
         || !is_int_index(idx.dtype)
         || scales.dtype != out.dtype
@@ -3038,10 +3057,12 @@ pub fn register(registry: &mut OpRegistry) {
 mod compile_shape_safety_tests {
     use super::{
         block_quantized_compile_shape_safety, block_shape_ok, claim_quant_axis,
+        gather_block_quantized_compile_shape_safety,
         gather_block_quantized_compile_shape_safety_for, matmulnbits_compile_shape_safety_for,
         quant_axis, quant_param_shape_ok,
     };
-    use crate::registry::CompileShapeSafety;
+    use crate::registry::{CompileShapeSafety, NodeView};
+    use crate::sys::ort;
 
     #[test]
     fn block_quantized_matmul_is_shapeless_only_without_trim_slice() {
@@ -3078,6 +3099,116 @@ mod compile_shape_safety_tests {
         assert!(
             !gather_block_quantized_compile_shape_safety_for(192, 2, 128, true).allows_shapeless()
         );
+    }
+
+    #[test]
+    fn gather_block_quantized_omitted_block_size_keeps_asymmetric_form_shapeless() {
+        static DATA_SHAPE: [i64; 2] = [2, 128];
+        static ZERO_POINTS_SHAPE: [i64; 2] = [2, 1];
+
+        // Shape arrays stand in for opaque ORT handles; these callbacks only read their dimensions.
+        unsafe extern "C" fn num_inputs(
+            _: *const ort::OrtNode,
+            out: *mut usize,
+        ) -> *mut ort::OrtStatus {
+            unsafe { *out = 4 };
+            std::ptr::null_mut()
+        }
+
+        unsafe extern "C" fn inputs(
+            _: *const ort::OrtNode,
+            out: *mut *const ort::OrtValueInfo,
+            _: usize,
+        ) -> *mut ort::OrtStatus {
+            unsafe {
+                *out = DATA_SHAPE.as_ptr().cast();
+                *out.add(1) = std::ptr::null();
+                *out.add(2) = std::ptr::null();
+                *out.add(3) = ZERO_POINTS_SHAPE.as_ptr().cast();
+            }
+            std::ptr::null_mut()
+        }
+
+        unsafe extern "C" fn type_info(
+            value: *const ort::OrtValueInfo,
+            out: *mut *const ort::OrtTypeInfo,
+        ) -> *mut ort::OrtStatus {
+            unsafe { *out = value.cast() };
+            std::ptr::null_mut()
+        }
+
+        unsafe extern "C" fn onnx_type(
+            _: *const ort::OrtTypeInfo,
+            out: *mut ort::ONNXType,
+        ) -> *mut ort::OrtStatus {
+            unsafe { *out = ort::ONNXType_ONNX_TYPE_TENSOR };
+            std::ptr::null_mut()
+        }
+
+        unsafe extern "C" fn tensor_info(
+            info: *const ort::OrtTypeInfo,
+            out: *mut *const ort::OrtTensorTypeAndShapeInfo,
+        ) -> *mut ort::OrtStatus {
+            unsafe { *out = info.cast() };
+            std::ptr::null_mut()
+        }
+
+        unsafe extern "C" fn element_type(
+            _: *const ort::OrtTensorTypeAndShapeInfo,
+            out: *mut ort::ONNXTensorElementDataType,
+        ) -> *mut ort::OrtStatus {
+            unsafe { *out = ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 };
+            std::ptr::null_mut()
+        }
+
+        unsafe extern "C" fn rank(
+            _: *const ort::OrtTensorTypeAndShapeInfo,
+            out: *mut usize,
+        ) -> *mut ort::OrtStatus {
+            unsafe { *out = 2 };
+            std::ptr::null_mut()
+        }
+
+        unsafe extern "C" fn dimensions(
+            info: *const ort::OrtTensorTypeAndShapeInfo,
+            out: *mut i64,
+            count: usize,
+        ) -> *mut ort::OrtStatus {
+            unsafe { std::ptr::copy_nonoverlapping(info.cast::<i64>(), out, count) };
+            std::ptr::null_mut()
+        }
+
+        unsafe extern "C" fn absent_attribute(
+            _: *const ort::OrtNode,
+            _: *const std::ffi::c_char,
+            out: *mut *const ort::OrtOpAttr,
+        ) -> *mut ort::OrtStatus {
+            unsafe { *out = std::ptr::null() };
+            std::ptr::null_mut()
+        }
+
+        unsafe extern "C" fn input_name(
+            _: *const ort::OrtValueInfo,
+            out: *mut *const std::ffi::c_char,
+        ) -> *mut ort::OrtStatus {
+            unsafe { *out = c"zero_points".as_ptr() };
+            std::ptr::null_mut()
+        }
+
+        let mut api: ort::OrtApi = unsafe { std::mem::zeroed() };
+        api.Node_GetNumInputs = Some(num_inputs);
+        api.Node_GetInputs = Some(inputs);
+        api.GetValueInfoTypeInfo = Some(type_info);
+        api.GetOnnxTypeFromTypeInfo = Some(onnx_type);
+        api.CastTypeInfoToTensorInfo = Some(tensor_info);
+        api.GetTensorElementType = Some(element_type);
+        api.GetDimensionsCount = Some(rank);
+        api.GetDimensions = Some(dimensions);
+        api.Node_GetAttributeByName = Some(absent_attribute);
+        api.GetValueInfoName = Some(input_name);
+        let node = NodeView::new(&api, std::ptr::null());
+
+        assert!(gather_block_quantized_compile_shape_safety(&node).allows_shapeless());
     }
 
     #[test]
