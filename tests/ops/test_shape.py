@@ -181,7 +181,7 @@ def test_reshape_zero_and_infer():
 
 
 def test_reshape_allowzero_without_zeros():
-    # dynamo exporter sets allowzero=1 on everyreshape; with no 0 in the target it is a plian reshape.
+    # dynamo exporter sets allowzero=1 on every Reshape; with no 0 in the target it is a plain reshape.
     data = sample(np.float32, [2, 3, 4])
     shape = np.array([2, -1, 4], np.int64)
     model = build(
